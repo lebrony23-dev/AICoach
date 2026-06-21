@@ -2,7 +2,8 @@ import os
 import json
 import logging
 import sqlite3
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from typing import Dict, Any
 
 logger = logging.getLogger("coach")
@@ -48,14 +49,10 @@ def generate_coaching_message(context: Dict[str, Any]) -> str:
         logger.error("GEMINI_API_KEY environment variable is not set.")
         return "⚠️ Error: GEMINI_API_KEY is not set in environment."
 
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
     
-    # Select the model. Default to gemini-3.5-flash as it is highly efficient and recommended
-    model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=COACH_SYSTEM_PROMPT
-    )
+    # Select the model. Default to gemini-2.5-flash as it is highly efficient and recommended
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     
     # We pass the structured context as JSON to the model
     context_json = json.dumps(context, indent=2)
@@ -63,7 +60,13 @@ def generate_coaching_message(context: Dict[str, Any]) -> str:
     prompt = f"Here is the pre-computed readiness context: \n\n```json\n{context_json}\n```\n\nPlease output the coaching report matching the template exactly."
     
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=COACH_SYSTEM_PROMPT
+            )
+        )
         return response.text
     except Exception as e:
         logger.error(f"Error generating content from Gemini: {e}")
@@ -144,8 +147,8 @@ def chat_with_coach(chat_id: int, context: Dict[str, Any], user_message: str) ->
         logger.error("GEMINI_API_KEY environment variable is not set.")
         return "⚠️ Error: GEMINI_API_KEY is not set in environment."
 
-    genai.configure(api_key=api_key)
-    model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+    client = genai.Client(api_key=api_key)
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     
     # Structure system prompt with current athlete baseline context
     system_prompt = (
@@ -156,11 +159,6 @@ def chat_with_coach(chat_id: int, context: Dict[str, Any], user_message: str) ->
         f"Athlete context: {json.dumps(context, indent=2)}"
     )
     
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=system_prompt
-    )
-    
     is_cloud = os.getenv("WEBHOOK_URL") is not None or os.getenv("FLY_APP_NAME") is not None
     default_db_path = "/data/garmin_data.db" if is_cloud else "garmin_data.db"
     db_path = os.getenv("DB_PATH", default_db_path)
@@ -168,8 +166,22 @@ def chat_with_coach(chat_id: int, context: Dict[str, Any], user_message: str) ->
     history = load_chat_history(chat_id, db_path)
     
     try:
-        # Start a native Gemini ChatSession with the rolling history
-        chat = model.start_chat(history=history)
+        formatted_history = []
+        for h in history:
+            formatted_history.append(
+                types.Content(
+                    role=h["role"],
+                    parts=[types.Part.from_text(text=p) for p in h["parts"]]
+                )
+            )
+            
+        chat = client.chats.create(
+            model=model_name,
+            history=formatted_history,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt
+            )
+        )
         response = chat.send_message(user_message)
         
         save_chat_message(chat_id, "user", user_message, db_path)
