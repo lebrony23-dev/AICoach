@@ -89,5 +89,103 @@ class TestReadinessEngine(unittest.TestCase):
         self.assertTrue(atl[63] < ctl[63], f"ATL ({atl[63]}) should decay to be less than CTL ({ctl[63]})")
         self.assertTrue(tsb[63] > 20.0, f"TSB ({tsb[63]}) should be strongly positive (taper behaviour)")
 
+    def test_database_override(self):
+        """Test that compute_readiness overrides ctl, atl, and calculates tsb from database row if available."""
+        import tempfile
+        import sqlite3
+        import os
+        from readiness_engine import compute_readiness
+        
+        # Create a temp DB
+        fd, db_path = tempfile.mkstemp()
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Create daily_physiological table
+            cursor.execute("""
+                CREATE TABLE daily_physiological (
+                    date TEXT PRIMARY KEY,
+                    resting_heart_rate REAL,
+                    acute_training_load REAL,
+                    chronic_training_load REAL,
+                    acute_to_chronic_ratio REAL,
+                    stress_average REAL,
+                    updated_at TEXT
+                )
+            """)
+            
+            # Create hrv_data and sleep_stages and running_activities tables to avoid errors
+            cursor.execute("""
+                CREATE TABLE hrv_data (
+                    date TEXT PRIMARY KEY,
+                    last_night_avg REAL,
+                    baseline_low REAL,
+                    baseline_upper REAL,
+                    weekly_avg REAL
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE sleep_stages (
+                    date TEXT PRIMARY KEY,
+                    sleep_score REAL,
+                    total_sleep_seconds REAL,
+                    sleep_start TEXT,
+                    sleep_end TEXT,
+                    raw_json TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE running_activities (
+                    activity_id TEXT PRIMARY KEY,
+                    date TEXT,
+                    start_time_local TEXT,
+                    name TEXT,
+                    distance_meters REAL,
+                    duration_seconds REAL,
+                    average_heart_rate REAL,
+                    max_heart_rate REAL,
+                    aerobic_training_effect REAL,
+                    anaerobic_training_effect REAL,
+                    estimated_fluid_loss REAL,
+                    raw_json TEXT
+                )
+            """)
+            
+            # Insert some physiological data
+            # Target date 2026-06-22
+            cursor.execute("""
+                INSERT INTO daily_physiological 
+                (date, resting_heart_rate, acute_training_load, chronic_training_load, acute_to_chronic_ratio, stress_average, updated_at)
+                VALUES 
+                ('2026-06-22', 48.0, 500.0, 600.0, 1.2, 25.0, '2026-06-22T07:00:00')
+            """)
+            
+            cursor.execute("""
+                INSERT INTO hrv_data (date, last_night_avg, baseline_low, baseline_upper, weekly_avg)
+                VALUES ('2026-06-22', 65.0, 60.0, 70.0, 65.0)
+            """)
+            
+            cursor.execute("""
+                INSERT INTO sleep_stages (date, sleep_score, total_sleep_seconds)
+                VALUES ('2026-06-22', 85, 28800)
+            """)
+            
+            conn.commit()
+            conn.close()
+            
+            # Run compute_readiness
+            report = compute_readiness(db_path, target_date_str='2026-06-22')
+            
+            # Assert overridden values
+            self.assertEqual(report.ctl, 60.0)
+            self.assertEqual(report.atl, 50.0)
+            self.assertEqual(report.tsb, 10.0)  # 60.0 - 50.0
+            
+        finally:
+            os.close(fd)
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
 if __name__ == '__main__':
     unittest.main()

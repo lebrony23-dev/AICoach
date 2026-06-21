@@ -348,9 +348,23 @@ def compute_readiness(db_path: str, target_date_str: Optional[str] = None) -> Re
         target_idx = N - 1
         ctl = ctl_series[target_idx]
         atl = atl_series[target_idx]
-        tsb = tsb_series[target_idx]
+        tsb = ctl - atl  # Remove the 1-day calculation lag from fallback path
+        
+        row = phys_rows.get(target_date.isoformat())
+        if row:
+            row_dict = dict(row)
+            db_ctl = row_dict.get('chronic_training_load')
+            db_atl = row_dict.get('acute_training_load')
+            
+            if db_ctl is not None:
+                ctl = db_ctl / 10.0  # Scale down to standard EWMA units
+            if db_atl is not None:
+                atl = db_atl / 10.0  # Scale down to standard EWMA units
+                
+            if db_ctl is not None and db_atl is not None:
+                tsb = ctl - atl  # Correctly scaled, non-lagged training stress balance
+                
         target_date_str_iso = target_date.isoformat()
-        row = phys_rows.get(target_date_str_iso)
         acwr = row['acute_to_chronic_ratio'] if row and row['acute_to_chronic_ratio'] is not None else acwr_series[target_idx]
         monotony = monotony_series[target_idx]
         strain = strain_series[target_idx]
