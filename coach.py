@@ -1,12 +1,40 @@
 import os
 import json
+import time
 import logging
 import sqlite3
 from google import genai
 from google.genai import types
-from typing import Dict, Any
+from typing import Dict, Any, Callable
 
 logger = logging.getLogger("coach")
+
+# Transient Gemini errors worth retrying (overload / rate-limit / brief outages).
+# A 503 UNAVAILABLE ("high demand") is almost always gone within a few seconds.
+_RETRYABLE_MARKERS = ("503", "unavailable", "429", "resource_exhausted",
+                      "overloaded", "deadline", "500", "internal")
+
+def _is_retryable(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(m in msg for m in _RETRYABLE_MARKERS)
+
+def _with_retry(fn: Callable, *, attempts: int = 4, base_delay: float = 2.0):
+    """Run fn() with exponential backoff on transient Gemini errors.
+    Delays: 2s, 4s, 8s. Non-transient errors raise immediately."""
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - genai raises generic ServerError
+            last = e
+            if not _is_retryable(e) or i == attempts - 1:
+                raise
+            delay = base_delay * (2 ** i)
+            logger.warning("Gemini transient error (attempt %d/%d): %s — retrying in %.0fs",
+                          i + 1, attempts, e, delay)
+            time.sleep(delay)
+    if last is not None:
+        raise last  # pragma: no cover
 
 COACH_SYSTEM_PROMPT = """You are an autonomous, expert marathon running coach guiding an athlete through the taper phase for the Gold Coast Marathon (July 6, 2026).
 
@@ -51,8 +79,8 @@ def generate_coaching_message(context: Dict[str, Any]) -> str:
 
     client = genai.Client(api_key=api_key)
     
-    # Select the model. Default to gemini-2.5-flash as it is highly efficient and recommended
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    # Select the model. Default aligned with .env.example (gemini-3.5-flash).
+    model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
     
     # We pass the structured context as JSON to the model
     context_json = json.dumps(context, indent=2)
@@ -60,16 +88,20 @@ def generate_coaching_message(context: Dict[str, Any]) -> str:
     prompt = f"Here is the pre-computed readiness context: \n\n```json\n{context_json}\n```\n\nPlease output the coaching report matching the template exactly."
     
     try:
-        response = client.models.generate_content(
+        response = _with_retry(lambda: client.models.generate_content(
             model=model_name,
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=COACH_SYSTEM_PROMPT
             )
-        )
+        ))
         return response.text
     except Exception as e:
-        logger.error(f"Error generating content from Gemini: {e}")
+        logger.error(f"Error generating content from Gemini after retries: {e}")
+        if _is_retryable(e):
+            return ("⚠️ Coach is temporarily overloaded (Gemini high demand). "
+                    "Already retried a few times — please ask again in a minute. "
+                    "Your training data is safe and unaffected.")
         return f"⚠️ Error generating coach response: {e}"
 
 
@@ -182,12 +214,15 @@ def chat_with_coach(chat_id: int, context: Dict[str, Any], user_message: str) ->
                 system_instruction=system_prompt
             )
         )
-        response = chat.send_message(user_message)
+        response = _with_retry(lambda: chat.send_message(user_message))
         
         save_chat_message(chat_id, "user", user_message, db_path)
         save_chat_message(chat_id, "model", response.text, db_path)
         
         return response.text
     except Exception as e:
-        logger.error(f"Error in interactive chat session: {e}")
+        logger.error(f"Error in interactive chat session after retries: {e}")
+        if _is_retryable(e):
+            return ("⚠️ Coach is temporarily overloaded (Gemini high demand). "
+                    "Already retried a few times — give it a minute and ask again.")
         return f"⚠️ Error generating response: {e}"
