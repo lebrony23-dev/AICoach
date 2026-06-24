@@ -36,6 +36,47 @@ def _with_retry(fn: Callable, *, attempts: int = 4, base_delay: float = 2.0):
     if last is not None:
         raise last  # pragma: no cover
 
+def _model_chain() -> list:
+    """Ordered list of models to try. Primary from GEMINI_MODEL, then
+    stable fallbacks. If the primary is overloaded (persistent 503), we
+    degrade to the next working model instead of going silent.
+    De-duplicates while preserving order."""
+    primary = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+    fallbacks = [m.strip() for m in os.getenv(
+        "GEMINI_FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.0-flash"
+    ).split(",") if m.strip()]
+    chain = []
+    for m in [primary] + fallbacks:
+        if m and m not in chain:
+            chain.append(m)
+    return chain
+
+def _generate_with_fallback(client, prompt, system_instruction):
+    """Try each model in the chain with retry. On persistent transient
+    failure (503/429) move to the next model. Non-transient errors raise."""
+    chain = _model_chain()
+    last_err = None
+    for idx, model_name in enumerate(chain):
+        try:
+            if idx > 0:
+                logger.warning("Falling back to model '%s' after '%s' was unavailable.",
+                              model_name, chain[idx - 1])
+            return _with_retry(lambda: client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction
+                )
+            ))
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if not _is_retryable(e):
+                raise
+            logger.error("Model '%s' still failing after retries: %s", model_name, e)
+            continue
+    if last_err is not None:
+        raise last_err  # pragma: no cover
+
 COACH_SYSTEM_PROMPT = """You are an autonomous, expert marathon running coach guiding an athlete through the taper phase for the Gold Coast Marathon (July 6, 2026).
 
 This is an EVENING briefing (sent ~9pm Melbourne time). Today's training is already done — your job is to brief the athlete on TOMORROW's session so they can plan the night before (lay out kit, set the alarm, fuel). Refer to the session as "TOMORROW", never "today".
@@ -81,27 +122,18 @@ def generate_coaching_message(context: Dict[str, Any]) -> str:
 
     client = genai.Client(api_key=api_key)
     
-    # Select the model. Default aligned with .env.example (gemini-3.5-flash).
-    model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-    
     # We pass the structured context as JSON to the model
     context_json = json.dumps(context, indent=2)
     
     prompt = f"Here is the pre-computed readiness context: \n\n```json\n{context_json}\n```\n\nPlease output the coaching report matching the template exactly."
     
     try:
-        response = _with_retry(lambda: client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=COACH_SYSTEM_PROMPT
-            )
-        ))
+        response = _generate_with_fallback(client, prompt, COACH_SYSTEM_PROMPT)
         return response.text
     except Exception as e:
-        logger.error(f"Error generating content from Gemini after retries: {e}")
+        logger.error(f"Error generating content from Gemini after all models/retries: {e}")
         if _is_retryable(e):
-            return ("⚠️ Coach is temporarily overloaded (Gemini high demand). "
+            return ("⚠️ Coach is temporarily overloaded (Gemini high demand across all models). "
                     "Already retried a few times — please ask again in a minute. "
                     "Your training data is safe and unaffected.")
         return f"⚠️ Error generating coach response: {e}"
@@ -182,7 +214,6 @@ def chat_with_coach(chat_id: int, context: Dict[str, Any], user_message: str) ->
         return "⚠️ Error: GEMINI_API_KEY is not set in environment."
 
     client = genai.Client(api_key=api_key)
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     
     # Structure system prompt with current athlete baseline context
     system_prompt = (
@@ -208,23 +239,42 @@ def chat_with_coach(chat_id: int, context: Dict[str, Any], user_message: str) ->
                     parts=[types.Part.from_text(text=p) for p in h["parts"]]
                 )
             )
-            
-        chat = client.chats.create(
-            model=model_name,
-            history=formatted_history,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt
-            )
-        )
-        response = _with_retry(lambda: chat.send_message(user_message))
-        
+
+        # Try each model in the chain; recreate the chat session per model so
+        # a persistently-overloaded primary falls back to a working model.
+        chain = _model_chain()
+        response = None
+        last_err = None
+        for idx, model_name in enumerate(chain):
+            try:
+                if idx > 0:
+                    logger.warning("Chat falling back to model '%s' after '%s' was unavailable.",
+                                  model_name, chain[idx - 1])
+                chat = client.chats.create(
+                    model=model_name,
+                    history=formatted_history,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt
+                    )
+                )
+                response = _with_retry(lambda: chat.send_message(user_message))
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if not _is_retryable(e):
+                    raise
+                logger.error("Chat model '%s' still failing after retries: %s", model_name, e)
+                continue
+        if response is None:
+            raise last_err if last_err is not None else RuntimeError("No model available")
+
         save_chat_message(chat_id, "user", user_message, db_path)
         save_chat_message(chat_id, "model", response.text, db_path)
         
         return response.text
     except Exception as e:
-        logger.error(f"Error in interactive chat session after retries: {e}")
+        logger.error(f"Error in interactive chat session after all models/retries: {e}")
         if _is_retryable(e):
-            return ("⚠️ Coach is temporarily overloaded (Gemini high demand). "
+            return ("⚠️ Coach is temporarily overloaded (Gemini high demand across all models). "
                     "Already retried a few times — give it a minute and ask again.")
         return f"⚠️ Error generating response: {e}"
