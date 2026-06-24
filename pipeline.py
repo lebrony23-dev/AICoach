@@ -5,6 +5,9 @@ import time
 import logging
 import sqlite3
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+
+MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
 from dotenv import load_dotenv
 from garminconnect import (
     Garmin,
@@ -813,7 +816,10 @@ def run_pipeline(days_to_fetch=7, dry_run=False, replay_date_str=None):
         start_date = datetime.strptime(replay_date_str, "%Y-%m-%d").date()
         end_date = start_date
     else:
-        end_date = date.today()
+        # Use Melbourne local date, NOT UTC. On Fly (UTC), date.today() at
+        # 8:30pm Melbourne still reads the prior UTC day -> pull stops a day
+        # short. Anchor to Australia/Melbourne so "today" is the athlete's today.
+        end_date = datetime.now(MELBOURNE_TZ).date()
         start_date = end_date - timedelta(days=days_to_fetch - 1)
 
     logger.info(f"Querying data range: {start_date} to {end_date}")

@@ -5,6 +5,7 @@ import sqlite3
 import shutil
 import asyncio
 from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -20,6 +21,25 @@ from coach import generate_coaching_message, chat_with_coach
 # Setup APScheduler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+# --- Health server (keeps the Fly machine alive 24/7) ---
+# The bot runs in long-polling mode and binds no port. Fly's http_service
+# (min_machines_running=1) needs SOMETHING listening on internal_port or it
+# marks the machine unhealthy and restart-loops it. This tiny thread answers
+# health checks so the machine stays up and the 3 AM APScheduler pull fires.
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+def start_health_server():
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        def log_message(self, format, *args):
+            pass  # silence per-request logging
+    port = int(os.getenv("HEALTH_PORT", os.getenv("PORT", "8080")))
+    HTTPServer(("0.0.0.0", port), _H).serve_forever()
 
 # Setup logging
 logging.basicConfig(
@@ -152,9 +172,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Failed to send error alert to owner: {alert_err}")
 
 # Scheduled Jobs (Part 5)
+MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
+
 def get_aest_today_str() -> str:
-    """Returns today's date in AEST timezone format (YYYY-MM-DD)."""
-    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=10))).date().isoformat()
+    """Returns today's date in Melbourne timezone (DST-aware) as YYYY-MM-DD."""
+    return datetime.now(MELBOURNE_TZ).date().isoformat()
 
 def db_backup_job():
     """Performs a consistent nightly SQLite backup of garmin_data.db."""
@@ -246,26 +268,25 @@ def watchdog_job():
         logger.info("Watchdog check passed. Morning push ran today.")
 
 async def setup_scheduler(application) -> None:
-    """Configures the scheduled jobs inside the app loop."""
-    scheduler = AsyncIOScheduler(timezone=timezone.utc)
-    
-    # We schedule in UTC time:
-    # 2 AM AEST -> 16:00 UTC (Backup)
-    # 3 AM AEST -> 17:00 UTC (Garmin Pull)
-    # 4 AM AEST -> 18:00 UTC (Morning Report Push)
-    # 5 AM AEST -> 19:00 UTC (Watchdog)
-    
-    scheduler.add_job(db_backup_job, CronTrigger(hour=16, minute=0))
-    scheduler.add_job(garmin_pull_job, CronTrigger(hour=17, minute=0))
-    scheduler.add_job(morning_report_job, CronTrigger(hour=18, minute=0))
-    scheduler.add_job(watchdog_job, CronTrigger(hour=19, minute=0))
-    
+    """Configures the scheduled jobs inside the app loop (Melbourne time, DST-aware)."""
+    scheduler = AsyncIOScheduler(timezone=MELBOURNE_TZ)
+
+    # Evening schedule (Melbourne local, auto-adjusts for AEST/AEDT):
+    # 8:15pm - DB backup
+    # 8:30pm - Garmin pull (all of today's data exists by now)
+    # 9:00pm - Evening coaching push (tomorrow's session, planned the night before)
+    # 9:30pm - Watchdog (verify the push ran)
+    scheduler.add_job(db_backup_job, CronTrigger(hour=20, minute=15, timezone=MELBOURNE_TZ))
+    scheduler.add_job(garmin_pull_job, CronTrigger(hour=20, minute=30, timezone=MELBOURNE_TZ))
+    scheduler.add_job(morning_report_job, CronTrigger(hour=21, minute=0, timezone=MELBOURNE_TZ))
+    scheduler.add_job(watchdog_job, CronTrigger(hour=21, minute=30, timezone=MELBOURNE_TZ))
+
     scheduler.start()
-    logger.info("APScheduler initialized and jobs scheduled in UTC time:")
-    logger.info(" - 16:00 UTC (2 AM AEST): Database Backup")
-    logger.info(" - 17:00 UTC (3 AM AEST): Garmin Pull")
-    logger.info(" - 18:00 UTC (4 AM AEST): Morning Coaching Push")
-    logger.info(" - 19:00 UTC (5 AM AEST): Watchdog Verification")
+    logger.info("APScheduler initialized (Australia/Melbourne, DST-aware):")
+    logger.info(" - 20:15 Melbourne: Database Backup")
+    logger.info(" - 20:30 Melbourne: Garmin Pull")
+    logger.info(" - 21:00 Melbourne: Evening Coaching Push")
+    logger.info(" - 21:30 Melbourne: Watchdog Verification")
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -299,7 +320,11 @@ def main():
             webhook_url=f"{webhook_url}/webhook"
         )
     else:
-        logger.info("Starting bot in Long-Polling mode (Local testing)...")
+        logger.info("Starting bot in Long-Polling mode...")
+        # Start the health server so Fly's http_service keeps the machine
+        # alive 24/7 (polling binds no port on its own).
+        threading.Thread(target=start_health_server, daemon=True).start()
+        logger.info(f"Health server listening on port {int(os.getenv('HEALTH_PORT', os.getenv('PORT', '8080')))}")
         app.run_polling()
 
 if __name__ == "__main__":
